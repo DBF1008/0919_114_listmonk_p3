@@ -86,11 +86,6 @@ func (p *pipe) NextSubscribers() (bool, error) {
 		return false, nil
 	}
 
-	// Is there a sliding window limit configured?
-	hasSliding := p.m.cfg.SlidingWindow &&
-		p.m.cfg.SlidingWindowRate > 0 &&
-		p.m.cfg.SlidingWindowDuration.Seconds() > 1
-
 	// Push messages.
 	for _, s := range subs {
 		msg, err := p.newMessage(s)
@@ -103,34 +98,56 @@ func (p *pipe) NextSubscribers() (bool, error) {
 		// the queue is drained.
 		p.m.campMsgQ <- msg
 
-		// Check if the sliding window is active.
-		if hasSliding {
-			diff := time.Since(p.m.slidingStart)
-
-			// Window has expired. Reset the clock.
-			if diff >= p.m.cfg.SlidingWindowDuration {
-				p.m.slidingStart = time.Now()
-				p.m.slidingCount = 0
-			}
-
-			// Have the messages exceeded the limit?
-			p.m.slidingCount++
-			if p.m.slidingCount >= p.m.cfg.SlidingWindowRate {
-				wait := p.m.cfg.SlidingWindowDuration - diff
-
-				p.m.log.Printf("messages exceeded (%d) for the window (%v since %s). Sleeping for %s.",
-					p.m.slidingCount,
-					p.m.cfg.SlidingWindowDuration,
-					p.m.slidingStart.Format(time.RFC822Z),
-					wait.Round(time.Second)*1)
-
-				p.m.slidingCount = 0
-				time.Sleep(wait)
-			}
-		}
+		// Apply the sliding window rate limit, if configured.
+		p.m.slidingWindowWait()
 	}
 
 	return true, nil
+}
+
+// slidingWindowWait enforces the configured sliding window message rate limit.
+// The counter and window state are shared across all goroutines pushing
+// messages, so the check-and-reset is guarded by a mutex to keep the limit
+// accurate under concurrency.
+func (m *Manager) slidingWindowWait() {
+	// Is there a sliding window limit configured?
+	if !m.cfg.SlidingWindow ||
+		m.cfg.SlidingWindowRate <= 0 ||
+		m.cfg.SlidingWindowDuration.Seconds() <= 1 {
+		return
+	}
+
+	m.slidingMut.Lock()
+	defer m.slidingMut.Unlock()
+
+	diff := time.Since(m.slidingStart)
+
+	// Window has expired. Reset the clock.
+	if diff >= m.cfg.SlidingWindowDuration {
+		m.slidingStart = time.Now()
+		m.slidingCount = 0
+		diff = 0
+	}
+
+	// Have the messages exceeded the limit?
+	m.slidingCount++
+	if m.slidingCount < m.cfg.SlidingWindowRate {
+		return
+	}
+
+	wait := m.cfg.SlidingWindowDuration - diff
+
+	m.log.Printf("messages exceeded (%d) for the window (%v since %s). Sleeping for %s.",
+		m.slidingCount,
+		m.cfg.SlidingWindowDuration,
+		m.slidingStart.Format(time.RFC822Z),
+		wait.Round(time.Second)*1)
+
+	// Sleep while holding the lock so that concurrent goroutines can't push
+	// messages past the limit, then reset the window.
+	time.Sleep(wait)
+	m.slidingCount = 0
+	m.slidingStart = time.Now()
 }
 
 // OnError keeps track of the number of errors that occur while sending messages

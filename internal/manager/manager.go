@@ -88,6 +88,7 @@ type Manager struct {
 	// Sliding window keeps track of the total number of messages sent in a period
 	// and on reaching the specified limit, waits until the window is over before
 	// sending further messages.
+	slidingMut   sync.Mutex
 	slidingCount int
 	slidingStart time.Time
 
@@ -146,6 +147,14 @@ type Config struct {
 }
 
 var pushTimeout = time.Second * 3
+
+var (
+	// pipeRequeueRetries is the number of times queueing a pipe back into
+	// nextPipes is retried (with pipeRequeueInterval delay in between) when
+	// the queue is full, before giving up and releasing the pipe.
+	pipeRequeueRetries  = 10
+	pipeRequeueInterval = time.Millisecond * 100
+)
 
 // New returns a new instance of Mailer.
 func New(cfg Config, store Store, i *i18n.I18n, l *log.Logger) *Manager {
@@ -294,11 +303,18 @@ func (m *Manager) Run() {
 			select {
 			case m.nextPipes <- p:
 			default:
-				// If the queue is full for any reason, stop the pipe and release it.
-				// The cleanup() records the state in DB and scanCampaigns() picks it up
-				// at a later point.
-				p.Stop(false)
-				p.wg.Done()
+				// If the queue is full, retry briefly instead of dropping the
+				// pipe right away. Dropping it would stop the pipe, making
+				// workers discard its already queued messages even though the
+				// campaign's subscriber checkpoint in the DB has advanced past
+				// them, permanently losing those messages.
+				if !m.requeuePipe(p) {
+					// As a last resort, stop the pipe and release it.
+					// The cleanup() records the state in DB and scanCampaigns()
+					// picks it up at a later point.
+					p.Stop(false)
+					p.wg.Done()
+				}
 			}
 		} else {
 			// The pipe is created with a +1 on the waitgroup pseudo counter
@@ -448,14 +464,35 @@ func (m *Manager) scanCampaigns(tick time.Duration) {
 			select {
 			case m.nextPipes <- p:
 			default:
-				// If the queue is full for any reason, stop the pipe and release it.
-				// The cleanup() records the state in DB and scanCampaigns() picks it up
-				// at a later point.
-				p.Stop(false)
-				p.wg.Done()
+				// If the queue is full, retry briefly instead of dropping the
+				// pipe right away.
+				if !m.requeuePipe(p) {
+					// If the queue is still full, stop the pipe and release it.
+					// The cleanup() records the state in DB and scanCampaigns()
+					// picks it up at a later point.
+					p.Stop(false)
+					p.wg.Done()
+				}
 			}
 		}
 	}
+}
+
+// requeuePipe attempts to push a pipe back into the nextPipes queue. If the
+// queue is full, it retries for a short period instead of dropping the pipe
+// immediately. It returns false if the pipe couldn't be queued.
+func (m *Manager) requeuePipe(p *pipe) bool {
+	for i := 0; i < pipeRequeueRetries; i++ {
+		select {
+		case m.nextPipes <- p:
+			return true
+		default:
+			time.Sleep(pipeRequeueInterval)
+		}
+	}
+
+	m.log.Printf("nextPipes queue is full. releasing campaign pipe (%s) to be picked up later", p.camp.Name)
+	return false
 }
 
 // worker is a blocking function that perpetually listents to events (message) on different
@@ -526,9 +563,6 @@ func (m *Manager) worker() {
 
 			// Increment the send rate or the error counter if there was an error.
 			if msg.pipe != nil {
-				// Mark the message as done.
-				msg.pipe.wg.Done()
-
 				if err != nil {
 					// Call the error callback, which keeps track of the error count
 					// and stops the campaign if the error count exceeds the threshold.
@@ -541,6 +575,13 @@ func (m *Manager) worker() {
 					msg.pipe.rate.Incr(1)
 					msg.pipe.sent.Add(1)
 				}
+
+				// Mark the message as done only after all the pipe's state has
+				// been updated. cleanup() is triggered by the waitgroup and
+				// deletes the pipe from the manager; marking done last
+				// guarantees that no worker is still accessing the pipe's
+				// fields when cleanup() runs.
+				msg.pipe.wg.Done()
 			}
 
 		// Arbitrary message.
