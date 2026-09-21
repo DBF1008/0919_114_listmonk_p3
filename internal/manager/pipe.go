@@ -105,32 +105,45 @@ func (p *pipe) NextSubscribers() (bool, error) {
 
 		// Check if the sliding window is active.
 		if hasSliding {
-			diff := time.Since(p.m.slidingStart)
-
-			// Window has expired. Reset the clock.
-			if diff >= p.m.cfg.SlidingWindowDuration {
-				p.m.slidingStart = time.Now()
-				p.m.slidingCount = 0
-			}
-
-			// Have the messages exceeded the limit?
-			p.m.slidingCount++
-			if p.m.slidingCount >= p.m.cfg.SlidingWindowRate {
-				wait := p.m.cfg.SlidingWindowDuration - diff
-
-				p.m.log.Printf("messages exceeded (%d) for the window (%v since %s). Sleeping for %s.",
-					p.m.slidingCount,
-					p.m.cfg.SlidingWindowDuration,
-					p.m.slidingStart.Format(time.RFC822Z),
-					wait.Round(time.Second)*1)
-
-				p.m.slidingCount = 0
-				time.Sleep(wait)
-			}
+			p.m.throttleSlidingWindow()
 		}
 	}
 
 	return true, nil
+}
+
+// throttleSlidingWindow enforces the configured sliding window message rate.
+// Once the number of messages pushed within the current window reaches the
+// configured limit, it sleeps until the window elapses. The counter and the
+// window state are guarded by a mutex as NextSubscribers() may be invoked
+// concurrently for multiple campaigns; without it, lost increments would let
+// the actual send count exceed the configured SlidingWindowRate.
+func (m *Manager) throttleSlidingWindow() {
+	m.slidingMut.Lock()
+	defer m.slidingMut.Unlock()
+
+	diff := time.Since(m.slidingStart)
+
+	// Window has expired. Reset the clock.
+	if diff >= m.cfg.SlidingWindowDuration {
+		m.slidingStart = time.Now()
+		m.slidingCount = 0
+	}
+
+	// Have the messages exceeded the limit?
+	m.slidingCount++
+	if m.slidingCount >= m.cfg.SlidingWindowRate {
+		wait := m.cfg.SlidingWindowDuration - diff
+
+		m.log.Printf("messages exceeded (%d) for the window (%v since %s). Sleeping for %s.",
+			m.slidingCount,
+			m.cfg.SlidingWindowDuration,
+			m.slidingStart.Format(time.RFC822Z),
+			wait.Round(time.Second)*1)
+
+		m.slidingCount = 0
+		time.Sleep(wait)
+	}
 }
 
 // OnError keeps track of the number of errors that occur while sending messages

@@ -88,10 +88,16 @@ type Manager struct {
 	// Sliding window keeps track of the total number of messages sent in a period
 	// and on reaching the specified limit, waits until the window is over before
 	// sending further messages.
+	slidingMut   sync.Mutex
 	slidingCount int
 	slidingStart time.Time
 
 	tplFuncs template.FuncMap
+
+	// closeCh signals that the manager is shutting down so that
+	// asynchronous requeue attempts can abort.
+	closeCh   chan struct{}
+	closeOnce sync.Once
 }
 
 // CampaignMessage represents an instance of campaign message to be pushed out,
@@ -145,7 +151,13 @@ type Config struct {
 	ScanCampaigns bool
 }
 
-var pushTimeout = time.Second * 3
+var (
+	pushTimeout = time.Second * 3
+
+	// pipeRequeueInterval is the backoff interval between attempts to
+	// requeue a pipe when the nextPipes queue is full.
+	pipeRequeueInterval = time.Millisecond * 100
+)
 
 // New returns a new instance of Mailer.
 func New(cfg Config, store Store, i *i18n.I18n, l *log.Logger) *Manager {
@@ -175,6 +187,7 @@ func New(cfg Config, store Store, i *i18n.I18n, l *log.Logger) *Manager {
 		campMsgQ:     make(chan CampaignMessage, cfg.Concurrency*cfg.MessageRate*2),
 		msgQ:         make(chan models.Message, cfg.Concurrency*cfg.MessageRate*2),
 		slidingStart: time.Now(),
+		closeCh:      make(chan struct{}),
 	}
 	m.tplFuncs = m.makeGnericFuncMap()
 
@@ -291,15 +304,7 @@ func (m *Manager) Run() {
 
 		if has {
 			// There are more subscribers to fetch. Queue again.
-			select {
-			case m.nextPipes <- p:
-			default:
-				// If the queue is full for any reason, stop the pipe and release it.
-				// The cleanup() records the state in DB and scanCampaigns() picks it up
-				// at a later point.
-				p.Stop(false)
-				p.wg.Done()
-			}
+			m.requeuePipe(p)
 		} else {
 			// The pipe is created with a +1 on the waitgroup pseudo counter
 			// so that it immediately waits. Subsequently, every message created
@@ -413,8 +418,47 @@ func (m *Manager) StopCampaign(id int) {
 
 // Close closes and exits the campaign manager.
 func (m *Manager) Close() {
+	m.closeOnce.Do(func() {
+		close(m.closeCh)
+	})
 	close(m.nextPipes)
 	close(m.msgQ)
+}
+
+// requeuePipe queues a pipe for its next round of subscriber processing. If
+// the queue is full, it retries asynchronously with a backoff instead of
+// stopping the pipe, which would discard the messages the pipe has already
+// pushed to the message queue.
+func (m *Manager) requeuePipe(p *pipe) {
+	select {
+	case m.nextPipes <- p:
+	default:
+		go func() {
+			t := time.NewTicker(pipeRequeueInterval)
+			defer t.Stop()
+
+			for {
+				select {
+				case m.nextPipes <- p:
+					return
+				case <-m.closeCh:
+					return
+				case <-t.C:
+				}
+			}
+		}()
+	}
+}
+
+// isPipeActive checks whether a pipe is still registered as active. A pipe
+// that has been cleaned up (removed from the active pipes map) must not be
+// touched, as its waitgroup has already been released.
+func (m *Manager) isPipeActive(p *pipe) bool {
+	m.pipesMut.RLock()
+	defer m.pipesMut.RUnlock()
+
+	active, ok := m.pipes[p.camp.ID]
+	return ok && active == p
 }
 
 // scanCampaigns is a blocking function that periodically scans the data source
@@ -444,16 +488,10 @@ func (m *Manager) scanCampaigns(tick time.Duration) {
 
 			// If subscriber processing is busy, move on. Blocking and waiting
 			// can end up in a race condition where the waiting campaign's
-			// state in the data source has changed.
-			select {
-			case m.nextPipes <- p:
-			default:
-				// If the queue is full for any reason, stop the pipe and release it.
-				// The cleanup() records the state in DB and scanCampaigns() picks it up
-				// at a later point.
-				p.Stop(false)
-				p.wg.Done()
-			}
+			// state in the data source has changed. Stopping the pipe would
+			// discard the messages it has already queued, so requeue it with
+			// a backoff instead.
+			m.requeuePipe(p)
 		}
 	}
 }
@@ -469,6 +507,13 @@ func (m *Manager) worker() {
 		case msg, ok := <-m.campMsgQ:
 			if !ok {
 				return
+			}
+
+			// The pipe may have been cleaned up (removed from the active
+			// pipes map) while its message was still in the queue. Skip such
+			// messages as the stale pipe's state is no longer safe to access.
+			if msg.pipe != nil && !m.isPipeActive(msg.pipe) {
+				continue
 			}
 
 			// If the campaign has ended or stopped, ignore the message.
